@@ -9,10 +9,11 @@ import replication_pb2_grpc
 class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
     def __init__(self):
         self.servers = [
-            ('10.0.0.240', 50051),
-            ('10.0.0.240', 50052),
-            ('10.0.0.223', 50053),
-            ('10.0.0.223', 50054)
+            ('10.0.0.108', 50051),
+            ('10.0.0.108', 50052),
+            ('10.0.0.108', 50053),
+            ('10.0.0.223', 50057),
+            ('10.0.0.223', 50058)
         ]
         self.server_loads = {f"{ip}:{port}": 0 for ip, port in self.servers}
         self.active_servers = set(f"{ip}:{port}" for ip, port in self.servers)
