@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+service Replication {
+  rpc HandleTask (TaskRequest) returns (TaskResponse);
+  rpc Write (WriteRequest) returns (WriteResponse);
+  rpc Read (ReadRequest) returns (ReadResponse);
+  rpc ReportLoad (LoadReport) returns (LoadResponse);
+}
+
+message TaskRequest {
+  string task_id = 1;
+}
+
+message TaskResponse {
+  string status = 1;
+}
+
+message WriteRequest {
+  string key = 1;
+  string data = 2;
+}
+
+message WriteResponse {
+  string status = 1;
+}
+
+message ReadRequest {
+  string key = 1;
+}
+
+message ReadResponse {
+  string status = 1;
+  string data = 2;
+  double timestamp = 3;
+}
+
+message LoadReport {
+  string server_id = 1;
+  int32 load = 2;
+}
+
+message LoadResponse {
+  string status = 1;
+}
