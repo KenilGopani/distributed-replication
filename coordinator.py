@@ -20,6 +20,35 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
         self.N = len(self.servers)  # Total number of servers
         self.W = 2  # Minimum writes for quorum
         self.R = 2  # Minimum reads for quorum
+        self.server_metrics = {server: {"load": 0, "last_task_time": 0} for server in self.server_loads}
+        self.threshold = 2  # Minimum load to disallow stealing
+        self.max_hops = 5  # Placeholder for distance metric
+
+    def calculate_rank(self, server):
+        """Calculate the rank of a server based on multiple factors."""
+        metrics = self.server_metrics[server]
+        load = metrics["load"]
+        last_task_time = metrics["last_task_time"]
+        
+        # Factors and weights
+        c0, c1, c2, c3 = 1.0, -1.0, -0.5, 0.2
+        x0 = max(0, self.threshold - load)  # Messages that can be stolen
+        x1 = load  # Current load
+        x2 = self.max_hops  # Distance (placeholder)
+        x3 = time.time() - last_task_time  # Delay since last task
+
+        # Rank equation
+        rank = c0 * x0 + c1 * x1 + c2 * x2 + c3 * x3
+        return rank
+
+    def get_best_server(self):
+        """Select the best server based on rank."""
+        with self.lock:
+            ranked_servers = {
+                server: self.calculate_rank(server)
+                for server in self.active_servers
+            }
+            return max(ranked_servers, key=ranked_servers.get, default=None)
 
     def get_least_loaded_server(self):
         with self.lock:
@@ -59,7 +88,7 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
     def HandleTask(self, request, context):
         print(f"Received task with ID: {request.task_id}")
         
-        selected_server = self.get_least_loaded_server()
+        selected_server = self.get_best_server()
         if not selected_server:
             return replication_pb2.TaskResponse(status="No servers available")
 
@@ -70,13 +99,14 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
             with grpc.insecure_channel(selected_server) as channel:
                 stub = replication_pb2_grpc.ReplicationStub(channel)
                 with self.lock:
-                    self.server_loads[selected_server] += 1
+                    self.server_metrics[selected_server]["load"] += 1
+                    self.server_metrics[selected_server]["last_task_time"] = time.time()
                 
                 response = stub.HandleTask(request)
                 print(f"Task {request.task_id} completed by server {selected_server}")
                 
                 with self.lock:
-                    self.server_loads[selected_server] -= 1
+                    self.server_metrics[selected_server]["load"] -= 1
                 
                 return response
                 
@@ -94,8 +124,23 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
                 for server in self.servers:
                     server_addr = f"{server[0]}:{server[1]}"
                     status = "ACTIVE" if server_addr in self.active_servers else "INACTIVE"
-                    load = self.server_loads.get(server_addr, 0)
+                    load = self.server_metrics[server_addr]["load"]
                     print(f"{server_addr}: {load} tasks ({status})")
+
+                # Fairness: Check for imbalances and redistribute tasks if needed
+                active_server_loads = {
+                    server: self.server_metrics[server]["load"]
+                    for server in self.active_servers
+                }
+                if active_server_loads:
+                    max_load = max(active_server_loads.values())
+                    min_load = min(active_server_loads.values())
+
+                    # If imbalance exceeds a threshold, redistribute tasks
+                    if max_load - min_load > 2:  # Example threshold
+                        print("Imbalance detected. Redistributing tasks...")
+                        # Logic to redistribute tasks (placeholder for now)
+
             time.sleep(5)
 
     def write(self, data):
