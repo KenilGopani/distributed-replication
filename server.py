@@ -57,7 +57,9 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
                         print(f"Failed to report load for server {self.server_id}")
             except grpc.RpcError as e:
                 print(f"Error reporting load for server {self.server_id}: {str(e)}")
-            time.sleep(5)  # Report load every 5 seconds
+            except Exception as e:
+                print(f"Unexpected error while reporting load: {str(e)}")
+            time.sleep(10)  # Increased timeout to 10 seconds
 
 def serve():
     parser = argparse.ArgumentParser(description="Start a replication server.")

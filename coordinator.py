@@ -79,10 +79,20 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
                             if server_addr not in self.active_servers:
                                 print(f"Server {server_addr} is now available")
                                 self.active_servers.add(server_addr)
-                except (grpc.FutureTimeoutError, grpc.RpcError):
+                except grpc.FutureTimeoutError:
+                    print(f"Timeout: Server {server_addr} did not respond in time")
                     with self.lock:
                         if server_addr in self.active_servers:
-                            print(f"Server {server_addr} is not responding")
+                            self.active_servers.remove(server_addr)
+                except grpc.RpcError as e:
+                    print(f"RPC Error: Could not connect to server {server_addr}: {e}")
+                    with self.lock:
+                        if server_addr in self.active_servers:
+                            self.active_servers.remove(server_addr)
+                except Exception as e:
+                    print(f"Unexpected error while checking server {server_addr}: {e}")
+                    with self.lock:
+                        if server_addr in self.active_servers:
                             self.active_servers.remove(server_addr)
             time.sleep(5)
 
