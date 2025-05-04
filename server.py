@@ -5,6 +5,7 @@ import argparse
 import threading
 import replication_pb2
 import replication_pb2_grpc
+import random
 
 class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
     def __init__(self, server_id, ip_address):
@@ -20,9 +21,13 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
             "127.0.0.1:50054": 0,
             "127.0.0.1:50055": 0
         }
+        # Hinted-handoff queue for failed write replications
+        self.hints = {peer: [] for peer in self.server_metrics.keys()}
 
     def Write(self, request, context):
         """Handle write requests with logging to debug peer communication."""
+        # Detect forwarded writes to avoid replication loops
+        is_forwarded = any(md.key == 'forwarded' and md.value == 'true' for md in context.invocation_metadata())
         with self.lock:
             self.data_store[request.key] = {
                 "data": request.data,
@@ -33,6 +38,23 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
 
         # Log the receipt of the write request
         print(f"Received Write request for key: {request.key} with data: {request.data}")
+
+        # Replicate write to two random peers only for original requests
+        if not is_forwarded:
+            peers = [p for p in self.server_metrics.keys() if p != self.server_id]
+            selected = random.sample(peers, min(2, len(peers)))
+            for peer in selected:
+                try:
+                    with grpc.insecure_channel(peer) as channel:
+                        stub = replication_pb2_grpc.ReplicationStub(channel)
+                        # Mark this write as forwarded to prevent re-replication
+                        stub.Write(request, timeout=5, metadata=[('forwarded', 'true')])
+                        print(f"Replicated write for key {request.key} to peer {peer}")
+                except grpc.RpcError as e:
+                    print(f"Error replicating write to peer {peer}: {str(e)} - queued for retry")
+                    # Queue hint for retry when peer recovers
+                    with self.lock:
+                        self.hints[peer].append(replication_pb2.WriteRequest(key=request.key, data=request.data))
 
         # Simulate processing time
         time.sleep(0.5)
@@ -152,6 +174,23 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
                             print(f"Unexpected error while redistributing task: {str(e)}")
             time.sleep(10)  # Check for imbalances every 10 seconds
 
+    def process_hints(self):
+        """Background thread: retry hinted writes to peers that were previously unreachable."""
+        while True:
+            with self.lock:
+                for peer, queue in list(self.hints.items()):
+                    remaining = []
+                    for hint_req in queue:
+                        try:
+                            with grpc.insecure_channel(peer) as channel:
+                                stub = replication_pb2_grpc.ReplicationStub(channel)
+                                stub.Write(hint_req, timeout=5, metadata=[('forwarded','true')])
+                                print(f"Replayed hinted write for key {hint_req.key} to {peer}")
+                        except grpc.RpcError:
+                            remaining.append(hint_req)
+                    self.hints[peer] = remaining
+            time.sleep(5)
+
 def serve():
     parser = argparse.ArgumentParser(description="Start a replication server.")
     parser.add_argument('--port', type=int, default=50051, help='Port number for the server')
@@ -170,6 +209,10 @@ def serve():
     # Start task redistribution thread
     task_redistribution_thread = threading.Thread(target=servicer.redistribute_tasks, daemon=True)
     task_redistribution_thread.start()
+
+    # Start hinted-handoff retry thread for failure recovery
+    hint_thread = threading.Thread(target=servicer.process_hints, daemon=True)
+    hint_thread.start()
 
     server.add_insecure_port(f'0.0.0.0:{args.port}')
     server.start()
