@@ -23,6 +23,20 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
         }
         # Hinted-handoff queue for failed write replications
         self.hints = {peer: [] for peer in self.server_metrics.keys()}
+        self.threshold = 1
+        self.max_hops = 5
+        self.last_task_time = time.time()
+        # Weights for rank equation
+        self.c0, self.c1, self.c2, self.c3 = 1.0, -1.0, -0.5, 0.2
+
+    def calculate_rank(self, server):
+        """Compute rank score for a server based on factors."""
+        load = self.server_metrics.get(server, 0)
+        x0 = max(0, self.threshold - load)
+        x1 = load
+        x2 = self.max_hops
+        x3 = time.time() - self.last_task_time
+        return self.c0*x0 + self.c1*x1 + self.c2*x2 + self.c3*x3
 
     def Write(self, request, context):
         """Handle write requests with logging to debug peer communication."""
@@ -111,8 +125,19 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
         return replication_pb2.ReadResponse(status="Failed: Key not found")
 
     def HandleTask(self, request, context):
-        print(f"Processing task with ID: {request.task_id}")
-        # Simulate task processing
+        print(f"Incoming task {request.task_id} at {self.server_id}")
+        # choose best server by rank
+        scores = {srv: self.calculate_rank(srv) for srv in self.server_metrics}
+        best = max(scores, key=scores.get)
+        if best != self.server_id:
+            # forward task
+            print(f"Forwarding task {request.task_id} to {best}")
+            with grpc.insecure_channel(best) as ch:
+                stub = replication_pb2_grpc.ReplicationStub(ch)
+                return stub.HandleTask(request)
+        # process locally
+        self.last_task_time = time.time()
+        print(f"Processing locally {request.task_id}")
         time.sleep(0.5)  # Simulate a delay for task processing
         return replication_pb2.TaskResponse(status="Success")
 
