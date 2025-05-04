@@ -5,6 +5,8 @@ service Replication {
   rpc Write (WriteRequest) returns (WriteResponse);
   rpc Read (ReadRequest) returns (ReadResponse);
   rpc ReportLoad (LoadReport) returns (LoadResponse);
+  rpc ShareLoad (LoadReport) returns (LoadResponse);
+  rpc RedistributeTask (TaskRequest) returns (TaskResponse);
 }
 
 message TaskRequest {
