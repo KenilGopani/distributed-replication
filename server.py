@@ -44,47 +44,49 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
 
     def Read(self, request, context):
         """Handle read requests with logging to debug peer communication."""
-        responses = []
+        # Determine if this request is forwarded to avoid recursive peer queries
+        is_forwarded = any(md.key == 'forwarded' and md.value == 'true' for md in context.invocation_metadata())
 
-        # Query self first
+        # Query self first and return immediately if found
         with self.lock:
             if request.key in self.data_store:
                 record = self.data_store[request.key]
-                responses.append(record)
                 print(f"Read request: Found key {request.key} locally with data: {record['data']}")
-            else:
-                print(f"Read request: Key {request.key} not found locally.")
+                return replication_pb2.ReadResponse(
+                    status="Success",
+                    data=record['data'],
+                    timestamp=record['timestamp']
+                )
 
-        # Query peers
-        for peer in self.server_metrics.keys():
-            if peer != self.server_id:  # Avoid querying itself
-                try:
-                    with grpc.insecure_channel(peer) as channel:
-                        stub = replication_pb2_grpc.ReplicationStub(channel)
-                        response = stub.Read(request, timeout=5)  # Add a 5-second timeout
-                        if response.status == "Success":
-                            responses.append({
-                                "data": response.data,
-                                "timestamp": response.timestamp
-                            })
-                            print(f"Read request: Received data from peer {peer} for key {request.key}.")
-                        else:
-                            print(f"Read request: Peer {peer} did not find key {request.key}.")
-                except grpc.RpcError as e:
-                    print(f"Error reading from peer {peer}: {str(e)}")
+        # Prepare to collect peer responses for keys not found locally
+        responses = []
+        # Query peers only for original requests, skip for forwarded
+        if not is_forwarded:
+            for peer in self.server_metrics.keys():
+                if peer != self.server_id:  # Avoid querying itself
+                    try:
+                        with grpc.insecure_channel(peer) as channel:
+                            stub = replication_pb2_grpc.ReplicationStub(channel)
+                            # Forwarded reads include metadata to avoid re-querying
+                            response = stub.Read(request, timeout=5, metadata=[('forwarded', 'true')])  
+                            if response.status == "Success":
+                                responses.append({"data": response.data, "timestamp": response.timestamp})
+                                print(f"Read request: Received data from peer {peer} for key {request.key}.")
+                    except grpc.RpcError as e:
+                        print(f"Error reading from peer {peer}: {str(e)}")
 
-        # Reconcile responses
+        # Reconcile peer responses
         if responses:
-            latest_record = max(responses, key=lambda r: r["timestamp"])
-            print(f"Read request: Returning latest data for key {request.key}: {latest_record['data']}")
+            latest = max(responses, key=lambda r: r['timestamp'])
+            print(f"Read request: Returning latest data for key {request.key}: {latest['data']}")
             return replication_pb2.ReadResponse(
                 status="Success",
-                data=latest_record["data"],
-                timestamp=latest_record["timestamp"]
+                data=latest['data'],
+                timestamp=latest['timestamp']
             )
-        else:
-            print(f"Read request: Key {request.key} not found in any server.")
-            return replication_pb2.ReadResponse(status="Failed: Key not found")
+        # No data found locally or on peers
+        print(f"Read request: Key {request.key} not found in any server.")
+        return replication_pb2.ReadResponse(status="Failed: Key not found")
 
     def HandleTask(self, request, context):
         print(f"Processing task with ID: {request.task_id}")

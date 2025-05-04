@@ -56,19 +56,21 @@ def test_write_and_read():
         "127.0.0.1:50055"
     ]
 
-    # Test Write Operation
+    # Test Write Operation: track which server handled each write
     print("Testing Write Operation...")
+    write_servers = []
     for i in range(3):
         key = f"key{i}"
         data = f"value{i}"
         server_address = random.choice(servers)
+        write_servers.append(server_address)
         test_write(server_address, key, data)
 
-    # Test Read Operation
+    # Test Read Operation: read from the same servers used for writes
     print("Testing Read Operation...")
     for i in range(3):
         key = f"key{i}"
-        server_address = random.choice(servers)
+        server_address = write_servers[i]
         test_read(server_address, key)
 
 def main():
