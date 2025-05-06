@@ -6,6 +6,7 @@ import threading
 import replication_pb2
 import replication_pb2_grpc
 import random
+from collections import deque
 
 class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
     def __init__(self, server_id, ip_address):
@@ -28,6 +29,11 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
         self.last_task_time = time.time()
         # Weights for rank equation
         self.c0, self.c1, self.c2, self.c3 = 1.0, -1.0, -0.5, 0.2
+        # Local queue of pending tasks
+        self.task_queue = deque()
+        # Start local task processor thread
+        processor_thread = threading.Thread(target=self.process_tasks, daemon=True)
+        processor_thread.start()
 
     def calculate_rank(self, server):
         """Compute rank score for a server based on factors."""
@@ -80,49 +86,48 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
 
     def Read(self, request, context):
         """Handle read requests with logging to debug peer communication."""
-        # Determine if this request is forwarded to avoid recursive peer queries
+        # Determine if forwarded to avoid recursive queries
         is_forwarded = any(md.key == 'forwarded' and md.value == 'true' for md in context.invocation_metadata())
-
-        # Query self first and return immediately if found
+        # Check local store
         with self.lock:
             if request.key in self.data_store:
-                record = self.data_store[request.key]
-                print(f"Read request: Found key {request.key} locally with data: {record['data']}")
-                return replication_pb2.ReadResponse(
-                    status="Success",
-                    data=record['data'],
-                    timestamp=record['timestamp']
-                )
+                rec = self.data_store[request.key]
+                print(f"Read: local hit {request.key} -> {rec['data']}")
+                if is_forwarded:
+                    # For forwarded reads, return immediately
+                    return replication_pb2.ReadResponse(status="Success", data=rec['data'], timestamp=rec['timestamp'])
+                # For original requests, start with local response
+                responses = [{"data": rec['data'], "timestamp": rec['timestamp']}]
+            else:
+                if is_forwarded:
+                    # Key not found locally on forwarded read
+                    return replication_pb2.ReadResponse(status="Failed: Key not found")
+                responses = []
 
-        # Prepare to collect peer responses for keys not found locally
-        responses = []
-        # Query peers only for original requests, skip for forwarded
+        # 2) peer reads for original requests until R=2 fulfilled
         if not is_forwarded:
-            for peer in self.server_metrics.keys():
-                if peer != self.server_id:  # Avoid querying itself
-                    try:
-                        with grpc.insecure_channel(peer) as channel:
-                            stub = replication_pb2_grpc.ReplicationStub(channel)
-                            # Forwarded reads include metadata to avoid re-querying
-                            response = stub.Read(request, timeout=5, metadata=[('forwarded', 'true')])  
-                            if response.status == "Success":
-                                responses.append({"data": response.data, "timestamp": response.timestamp})
-                                print(f"Read request: Received data from peer {peer} for key {request.key}.")
-                    except grpc.RpcError as e:
-                        print(f"Error reading from peer {peer}: {str(e)}")
-
-        # Reconcile peer responses
-        if responses:
-            latest = max(responses, key=lambda r: r['timestamp'])
-            print(f"Read request: Returning latest data for key {request.key}: {latest['data']}")
-            return replication_pb2.ReadResponse(
-                status="Success",
-                data=latest['data'],
-                timestamp=latest['timestamp']
-            )
-        # No data found locally or on peers
-        print(f"Read request: Key {request.key} not found in any server.")
-        return replication_pb2.ReadResponse(status="Failed: Key not found")
+            peers = [p for p in self.server_metrics.keys() if p != self.server_id]
+            random.shuffle(peers)
+            for peer in peers:
+                if len(responses) >= 2:
+                    break
+                try:
+                    with grpc.insecure_channel(peer) as channel:
+                        stub = replication_pb2_grpc.ReplicationStub(channel)
+                        resp = stub.Read(request, timeout=5, metadata=[('forwarded','true')])
+                        if resp.status == 'Success':
+                            responses.append({"data": resp.data, "timestamp": resp.timestamp})
+                            print(f"Read: got from peer {peer}: {resp.data}")
+                except grpc.RpcError as e:
+                    print(f"Read: peer {peer} error {e}")
+        # Enforce R>=2 quorum
+        if len(responses) >= 2:
+            best = max(responses, key=lambda r: r['timestamp'])
+            print(f"Read: returning latest {request.key} -> {best['data']}")
+            return replication_pb2.ReadResponse(status="Success", data=best['data'], timestamp=best['timestamp'])
+        # Quorum not met
+        print(f"Read: insufficient responses {len(responses)}/2 for key {request.key}")
+        return replication_pb2.ReadResponse(status=f"Failed: quorum {len(responses)}/2")
 
     def HandleTask(self, request, context):
         print(f"Incoming task {request.task_id} at {self.server_id}")
@@ -130,16 +135,86 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
         scores = {srv: self.calculate_rank(srv) for srv in self.server_metrics}
         best = max(scores, key=scores.get)
         if best != self.server_id:
-            # forward task
             print(f"Forwarding task {request.task_id} to {best}")
             with grpc.insecure_channel(best) as ch:
                 stub = replication_pb2_grpc.ReplicationStub(ch)
                 return stub.HandleTask(request)
-        # process locally
-        self.last_task_time = time.time()
-        print(f"Processing locally {request.task_id}")
-        time.sleep(0.5)  # Simulate a delay for task processing
-        return replication_pb2.TaskResponse(status="Success")
+        # enqueue locally
+        with self.lock:
+            self.task_queue.append(request)
+        print(f"Queued task {request.task_id} locally")
+        return replication_pb2.TaskResponse(status="Queued")
+
+    def process_tasks(self):
+        """Background thread: process tasks from local queue"""
+        while True:
+            with self.lock:
+                if self.task_queue:
+                    task = self.task_queue.popleft()
+                else:
+                    task = None
+            if task:
+                self.last_task_time = time.time()
+                print(f"Processing queued task {task.task_id} locally")
+                time.sleep(0.5)
+            else:
+                time.sleep(0.1)
+
+    def share_load_with_peers(self):
+        """Periodically share queue length with peers."""
+        while True:
+            with self.lock:
+                local_load = len(self.task_queue)
+                for peer in self.server_metrics.keys():
+                    if peer != self.server_id:
+                        try:
+                            with grpc.insecure_channel(peer) as channel:
+                                stub = replication_pb2_grpc.ReplicationStub(channel)
+                                request = replication_pb2.LoadReport(server_id=self.server_id, load=local_load)
+                                response = stub.ShareLoad(request)
+                                if response.status != "Success":
+                                    print(f"Failed to share load with peer {peer}")
+                        except Exception as e:
+                            print(f"Error sharing load with peer {peer}: {str(e)}")
+            time.sleep(5)
+
+    def redistribute_tasks(self):
+        """Periodically steal tasks from most loaded peer when imbalance exceeds threshold."""
+        while True:
+            with self.lock:
+                if self.server_metrics:
+                    most_loaded = max(self.server_metrics, key=self.server_metrics.get)
+                    least_loaded = min(self.server_metrics, key=self.server_metrics.get)
+                    load_diff = self.server_metrics[most_loaded] - self.server_metrics[least_loaded]
+                else:
+                    load_diff = 0
+            if load_diff > 2:
+                print(f"Attempting to steal task from {most_loaded} (diff={load_diff})")
+                try:
+                    with grpc.insecure_channel(most_loaded) as channel:
+                        stub = replication_pb2_grpc.ReplicationStub(channel)
+                        # ask peer to redistribute one task
+                        response = stub.RedistributeTask(replication_pb2.TaskRequest(task_id=""), timeout=5)
+                        status = response.status
+                        if status.startswith("STOLEN:"):
+                            stolen_id = status.split("STOLEN:")[1]
+                            with self.lock:
+                                self.task_queue.append(replication_pb2.TaskRequest(task_id=stolen_id))
+                            print(f"Stole task {stolen_id} from {most_loaded}")
+                        else:
+                            print(f"No task to steal from {most_loaded}")
+                except Exception as e:
+                    print(f"Error stealing task: {str(e)}")
+            time.sleep(10)
+
+    def RedistributeTask(self, request, context):
+        """Handle task steal requests: pop one queued task and return its ID"""
+        with self.lock:
+            if self.task_queue:
+                stolen = self.task_queue.popleft()
+                print(f"Redistributing task {stolen.task_id} to peer")
+                return replication_pb2.TaskResponse(status=f"STOLEN:{stolen.task_id}")
+        return replication_pb2.TaskResponse(status="NONE")
 
     def ShareLoad(self, request, context):
         """Handle load sharing between peers."""
@@ -147,57 +222,6 @@ class ReplicationServicer(replication_pb2_grpc.ReplicationServicer):
             self.server_metrics[request.server_id] = request.load
             print(f"Received load update from {request.server_id}: {request.load}")
         return replication_pb2.LoadResponse(status="Success")
-
-    def RedistributeTask(self, request, context):
-        """Handle task redistribution from peers."""
-        print(f"Received task redistribution request: {request.task_id}")
-        # Simulate task processing
-        time.sleep(0.5)
-        return replication_pb2.TaskResponse(status="Success")
-
-    def share_load_with_peers(self):
-        """Periodically share load information with peers."""
-        while True:
-            with self.lock:
-                for peer in self.server_metrics.keys():
-                    if peer != self.server_id:  # Avoid sending to itself
-                        try:
-                            with grpc.insecure_channel(peer) as channel:
-                                stub = replication_pb2_grpc.ReplicationStub(channel)
-                                request = replication_pb2.LoadReport(server_id=self.server_id, load=self.load)
-                                response = stub.ShareLoad(request)
-                                if response.status != "Success":
-                                    print(f"Failed to share load with peer {peer}")
-                        except grpc.RpcError as e:
-                            print(f"Error sharing load with peer {peer}: {str(e)}")
-                        except Exception as e:
-                            print(f"Unexpected error while sharing load with peer {peer}: {str(e)}")
-            time.sleep(5)  # Share load every 5 seconds
-
-    def redistribute_tasks(self):
-        """Periodically check for imbalances and redistribute tasks."""
-        while True:
-            with self.lock:
-                # Find the most and least loaded servers
-                if self.server_metrics:
-                    most_loaded = max(self.server_metrics, key=self.server_metrics.get)
-                    least_loaded = min(self.server_metrics, key=self.server_metrics.get)
-
-                    # Redistribute tasks if imbalance exceeds a threshold
-                    if self.server_metrics[most_loaded] - self.server_metrics[least_loaded] > 2:  # Example threshold
-                        print(f"Redistributing tasks from {most_loaded} to {least_loaded}")
-                        try:
-                            with grpc.insecure_channel(most_loaded) as channel:
-                                stub = replication_pb2_grpc.ReplicationStub(channel)
-                                request = replication_pb2.TaskRequest(task_id="redistributed_task")
-                                response = stub.RedistributeTask(request)
-                                if response.status != "Success":
-                                    print(f"Failed to redistribute task from {most_loaded} to {least_loaded}")
-                        except grpc.RpcError as e:
-                            print(f"Error redistributing task: {str(e)}")
-                        except Exception as e:
-                            print(f"Unexpected error while redistributing task: {str(e)}")
-            time.sleep(10)  # Check for imbalances every 10 seconds
 
     def process_hints(self):
         """Background thread: retry hinted writes to peers that were previously unreachable."""
@@ -235,6 +259,9 @@ def serve():
     task_redistribution_thread = threading.Thread(target=servicer.redistribute_tasks, daemon=True)
     task_redistribution_thread.start()
 
+    # Start local task processor for queued tasks
+    task_processor_thread = threading.Thread(target=servicer.process_tasks, daemon=True)
+    task_processor_thread.start()
     # Start hinted-handoff retry thread for failure recovery
     hint_thread = threading.Thread(target=servicer.process_hints, daemon=True)
     hint_thread.start()
